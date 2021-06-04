@@ -2,11 +2,6 @@
 
 set -e
 
-pwd
-ls -l
-
-#cd .local/lib/python3.8/site-packages/
-#ln -s ~/pygetm
-#ln -s ~/otps2
+export PYTHONPATH=$PYTHONPATH:$HOME/pygetm:$HOME/otps2
 
 
