@@ -12,3 +12,4 @@ dependencies:
   - ipympl
   - netcdf4
   - pyyaml
+  - mpi4py
