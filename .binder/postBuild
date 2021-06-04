@@ -2,8 +2,11 @@
 
 set -e
 
-cd .local/lib/python3.8/site-packages/
-ln -s ~/pygetm
-ln -s ~/otps2
+pwd
+ls -l
+
+#cd .local/lib/python3.8/site-packages/
+#ln -s ~/pygetm
+#ln -s ~/otps2
 
 
