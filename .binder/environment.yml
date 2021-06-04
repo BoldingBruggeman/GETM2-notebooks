@@ -1,0 +1,13 @@
+name: getm2-notebooks
+channels:
+  - conda-forge
+dependencies:
+  - python=3.8
+  - xarray
+  - jupyterlab
+  - numpy
+  - matplotlib
+  - scipy
+  - ipympl
+  - netcdf4
+  - pyyaml
