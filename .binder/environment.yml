@@ -13,4 +13,3 @@ dependencies:
   - netcdf4
   - pyyaml
   - mpi4py
-  - dotenv
