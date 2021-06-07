@@ -1,4 +1,2 @@
 gfortran
 libgfortran4
-python3-dotenv
-
