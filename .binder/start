@@ -1,5 +1,5 @@
 #!/bin/bash
 
-export PYTHONPATH=$PYTHONPATH:$HOME/pygetm:$HOME/otps2
+export PYTHONPATH=$PYTHONPATH:$HOME
 
 exec "$@"
