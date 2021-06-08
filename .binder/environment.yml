@@ -2,7 +2,7 @@ name: getm2-notebooks
 channels:
   - conda-forge
 dependencies:
-  - python=3.8
+  - python=3.6
   - xarray
   - jupyterlab
   - numpy
