@@ -5,7 +5,10 @@ import numpy.typing
 import xarray
 import netCDF4
 
-from . import _pygetm, core, parallel
+from . import _pygetm
+from . import core
+from . import parallel
+from . import output
 
 WEST  = 1
 NORTH = 2
@@ -21,16 +24,19 @@ def find_interfaces(c: numpy.ndarray):
     return c_if
 
 class Grid(_pygetm.Grid):
-    def __init__(self, domain: 'Domain', grid_type: int, ioffset: int, joffset: int):
+    def __init__(self, domain: 'Domain', grid_type: int, ioffset: int, joffset: int, ugrid: Optional['Grid']=None, vgrid: Optional['Grid']=None):
         _pygetm.Grid.__init__(self, domain, grid_type)
         self.halo = domain.halo
         self.type = grid_type
         self.ioffset = ioffset
         self.joffset = joffset
+        self.postfix = {_pygetm.TGRID: 't', _pygetm.UGRID: 'u', _pygetm.VGRID: 'v', _pygetm.XGRID: 'x', _pygetm.UUGRID: '_uu_adv', _pygetm.VVGRID: '_vv_adv', _pygetm.UVGRID: '_uv_adv', _pygetm.VUGRID: '_vu_adv'}[grid_type]
+        self.ugrid = ugrid
+        self.vgrid = vgrid
 
     def initialize(self):
         for name in ('x', 'y', 'dx', 'dy', 'lon', 'lat', 'dlon', 'dlat', 'H', 'D', 'mask', 'z', 'zo', 'area', 'iarea', 'cor'):
-            setattr(self, name, self.wrap(core.Array(), name.encode('ascii')))
+            setattr(self, name, self.wrap(core.Array(name=name + self.postfix), name.encode('ascii')))
         self.fill()
 
     def fill(self):
@@ -41,7 +47,9 @@ class Grid(_pygetm.Grid):
             source = getattr(self.domain, name + '_')
             if source is not None:
                 target = getattr(self, name).all_values
-                target[:, :] = source[self.joffset:self.joffset + 2 * nj:2, self.ioffset:self.ioffset + 2 * ni:2]
+                values = source[self.joffset:self.joffset + 2 * nj:2, self.ioffset:self.ioffset + 2 * ni:2]
+                target.fill(numpy.nan)
+                target[:values.shape[0], :values.shape[1]] = values
                 target.flags.writeable = name not in read_only
                 if has_bounds:
                     # Generate interface coordinates. These are not represented in Fortran as they are only needed for plotting.
@@ -51,8 +59,8 @@ class Grid(_pygetm.Grid):
                     setattr(self, name + 'i', values_i[self.halo:-self.halo, self.halo:-self.halo])
         self.iarea.all_values[:, :] = 1. / self.area.all_values[:, :]
 
-    def array(self, fill=None, dtype=float) -> core.Array:
-        return core.Array.create(self, fill, dtype)
+    def array(self, fill=None, dtype=float, **kwargs) -> core.Array:
+        return core.Array.create(self, fill, dtype, **kwargs)
 
     def as_xarray(self, data):
         assert data.shape == self.x.shape
@@ -79,20 +87,6 @@ class Grid(_pygetm.Grid):
         save('mask')
         save('area', 'm2')
         save('cor', 's-1', 'Coriolis parameter')
-
-    def map(self, source, source_grid: 'Grid'):
-        assert isinstance(source_grid, Grid)
-        target = None
-        if self.type == _pygetm.TGRID:
-            if source_grid.type == _pygetm.UGRID:
-                target = numpy.ma.masked_all(source.shape)
-                target[:, 1:] = 0.5 * (source[:, :-1] + source[:, 1:])
-            elif source_grid.type == _pygetm.VGRID:
-                target = numpy.ma.masked_all(source.shape)
-                target[1:, :] = 0.5 * (source[:-1, :] + source[1:, :])
-        if target is None:
-            raise NotImplementedError('Map not implemented for grid type %i -> grid type %i' % (source_grid.type, self.type))
-        return target
 
 def read_centers_to_supergrid(ncvar, ioffset: int, joffset: int, nx: int, ny: int, dtype=None):
     if dtype is None:
@@ -172,28 +166,29 @@ class Domain(_pygetm.Domain):
         else:
             nx, ny = x.size, y.size
             x, y = center_to_supergrid_1d(x), center_to_supergrid_1d(y)
-        domain = Domain(nx, ny, nz, x=x, y=y[:, numpy.newaxis], **kwargs)
-        return domain
+        return Domain.create(nx, ny, nz, x=x, y=y[:, numpy.newaxis], **kwargs)
 
     @staticmethod
-    def partition(tiling, nx: int, ny: int, nlev: int, global_domain, runtype):
-        assert nx % tiling.ncol == 0
-        assert ny % tiling.nrow == 0
+    def partition(tiling, nx: int, ny: int, nz: int, global_domain: Optional['Domain'], halo: int=2, **kwargs):
+        assert nx % tiling.ncol == 0, 'Cannot divide number of x points (%i) by number of subdomain columns (%i)' % (nx, tiling.ncol)
+        assert ny % tiling.nrow == 0, 'Cannot divide number of y points (%i) by number of subdomain rows (%i)' % (ny, tiling.nrow)
         assert global_domain is None or global_domain.initialized
 
-        domain = Domain(1, nlev, 1, ny // tiling.nrow, 1, nx // tiling.ncol, tiling=tiling)
+        halo = 0
+        share = 1
+        nx_loc, ny_loc = nx // tiling.ncol, ny // tiling.nrow
+        x = numpy.empty((2 * (ny_loc + halo) + 1, 2 * (nx_loc + halo) + 1))
+        y = numpy.empty_like(x)
+        parallel.Scatter(tiling, x, halo=halo, share=share)(None if global_domain is None else global_domain.x)
+        parallel.Scatter(tiling, y, halo=halo, share=share)(None if global_domain is None else global_domain.y)
+        domain = Domain(nx_loc, ny_loc, nz, x=x, y=y, tiling=tiling, f=0.)
 
-        # Scatter coordinates, bathymetry and mask to subdomains
-        domain.distribute(domain.T.x_).scatter(None if global_domain is None else global_domain.T.x)
-        domain.distribute(domain.T.y_).scatter(None if global_domain is None else global_domain.T.y)
-        domain.distribute(domain.T.H_).scatter(None if global_domain is None else global_domain.T.H)
-        domain.distribute(domain.T.mask_).scatter(None if global_domain is None else global_domain.T.mask)
-
-        # Extract 1D coordinate vectors per subdomain
-        domain.T.c1_[:] = domain.T.x_[domain.halo, :]
-        domain.T.c2_[:] = domain.T.y_[:, domain.halo]
-
-        domain.initialize(runtype)
+        halo = 4
+        parallel.Scatter(tiling, domain.mask_, halo=halo, share=share)(None if global_domain is None else global_domain.mask_)
+        parallel.Scatter(tiling, domain.H_, halo=halo, share=share)(None if global_domain is None else global_domain.H_)
+        parallel.Scatter(tiling, domain.z0_, halo=halo, share=share)(None if global_domain is None else global_domain.z0_)
+        parallel.Scatter(tiling, domain.z_, halo=halo, share=share)(None if global_domain is None else global_domain.z_)
+        parallel.Scatter(tiling, domain.zo_, halo=halo, share=share)(None if global_domain is None else global_domain.zo_)
 
         return domain
 
@@ -221,16 +216,39 @@ class Domain(_pygetm.Domain):
 
         # Since subdomains share the outer boundary, that boundary will be replicated in the outermost interior point and in the innermost halo point
         # We move the outer part of the halos (all but their innermost point) one point inwards to eliminate that overlapping point
-        data[:superhalo, :] = data_ext[:superhalo, 1:-1]
-        data[-superhalo:, :] = data_ext[-superhalo:, 1:-1]
-        data[:, :superhalo] = data_ext[1:-1, :superhalo]
-        data[:, -superhalo:] = data_ext[1:-1, -superhalo:]
+        data[:superhalo,              : superhalo] = data_ext[             :superhalo,                    : superhalo    ]
+        data[:superhalo,   superhalo  :-superhalo] = data_ext[             :superhalo,       superhalo + 1:-superhalo - 1]
+        data[:superhalo,  -superhalo  :          ] = data_ext[             :superhalo,      -superhalo    :              ]
+        data[ superhalo:  -superhalo, :superhalo]  = data_ext[superhalo + 1:-superhalo - 1,               : superhalo    ]
+        data[ superhalo:  -superhalo, -superhalo:] = data_ext[superhalo + 1:-superhalo - 1, -superhalo    :              ]
+        data[-superhalo:,             : superhalo] = data_ext[-superhalo:,                                : superhalo    ]
+        data[-superhalo:,  superhalo  :-superhalo] = data_ext[-superhalo:,                   superhalo + 1:-superhalo - 1]
+        data[-superhalo:, -superhalo  :          ] = data_ext[-superhalo:,                      -superhalo:              ]
+
+    @staticmethod
+    def create(nx: int, ny: int, nz: int, runtype: int=1, lon: Optional[numpy.ndarray]=None, lat: Optional[numpy.ndarray]=None, x: Optional[numpy.ndarray]=None, y: Optional[numpy.ndarray]=None, spherical: bool=False, mask: Optional[numpy.ndarray]=1, H: Optional[numpy.ndarray]=None, z0: Optional[numpy.ndarray]=None, f: Optional[numpy.ndarray]=None, tiling: Optional[parallel.Tiling]=None, z: Optional[numpy.ndarray]=0., zo: Optional[numpy.ndarray]=0., **kwargs):
+        global_domain = None
+        global_tiling = tiling = parallel.Tiling(**kwargs)
+        if tiling.n > 1:
+            global_tiling = parallel.Tiling(nrow=1, ncol=1, **kwargs)
+        if tiling.n == 1 or tiling.rank == 0:
+            global_domain = Domain(nx, ny, nz, lon, lat, x, y, spherical, tiling=global_tiling, mask=mask, H=H, z0=z0, f=f, z=z, zo=zo)
+        if tiling.n == 1:
+            return global_domain
+        if global_domain is not None:
+            global_domain.initialize(runtype=runtype)
+        subdomain = Domain.partition(tiling, nx, ny, nz, global_domain, runtype=runtype)
+        subdomain.glob = global_domain
+        return subdomain
 
     def __init__(self, nx: int, ny: int, nz: int, lon: Optional[numpy.ndarray]=None, lat: Optional[numpy.ndarray]=None, x: Optional[numpy.ndarray]=None, y: Optional[numpy.ndarray]=None, spherical: bool=False, mask: Optional[numpy.ndarray]=1, H: Optional[numpy.ndarray]=None, z0: Optional[numpy.ndarray]=None, f: Optional[numpy.ndarray]=None, tiling: Optional[parallel.Tiling]=None, z: Optional[numpy.ndarray]=0., zo: Optional[numpy.ndarray]=0., **kwargs):
         assert nx > 0, 'Number of x points is %i but must be > 0' % nx
         assert ny > 0, 'Number of y points is %i but must be > 0' % ny
         assert nz > 0, 'Number of z points is %i but must be > 0' % nz
         assert lat is not None or f is not None, 'Either lat of f must be provided to determine the Coriolis parameter.'
+
+        self.field_manager: Optional[output.FieldManager] = None
+        self.glob: Optional['Domain'] = self
 
         halo = 2
 
@@ -239,8 +257,8 @@ class Domain(_pygetm.Domain):
         shape_ = (shape[0] + 2 * superhalo, shape[1] + 2 * superhalo)
 
         # Set up subdomain partition information to enable halo exchanges
-        if tiling is None and kwargs:
-            tiling = parallel.Tiling(1, 1, **kwargs)
+        if tiling is None:
+            tiling = parallel.Tiling(**kwargs)
         self.tiling = tiling
 
         def setup_metric(source: Optional[numpy.ndarray]=None, optional: bool=False, fill_value=numpy.nan, relative_in_x: bool=False, relative_in_y: bool=False, dtype: numpy.typing.DTypeLike=float, writeable: bool=True) -> Tuple[Optional[numpy.ndarray], Optional[numpy.ndarray]]:
@@ -307,10 +325,16 @@ class Domain(_pygetm.Domain):
         self.halo = self.halox
         self.shape = (nz, ny + 2 * self.halo, nx + 2 * self.halo)
 
+        # Advection grids (two letters: first for advected quantity, second for advection direction)
+        self.UU = Grid(self, _pygetm.UUGRID, ioffset=3, joffset=1)
+        self.VV = Grid(self, _pygetm.VVGRID, ioffset=1, joffset=3)
+        self.UV = Grid(self, _pygetm.UVGRID, ioffset=2, joffset=2)
+        self.VU = Grid(self, _pygetm.VUGRID, ioffset=2, joffset=2)
+
         # Create grids
-        self.T = Grid(self, _pygetm.TGRID, ioffset=1, joffset=1)
-        self.U = Grid(self, _pygetm.UGRID, ioffset=2, joffset=1)
-        self.V = Grid(self, _pygetm.VGRID, ioffset=1, joffset=2)
+        self.U = Grid(self, _pygetm.UGRID, ioffset=2, joffset=1, ugrid=self.UU, vgrid=self.UV)
+        self.V = Grid(self, _pygetm.VGRID, ioffset=1, joffset=2, ugrid=self.VU, vgrid=self.VV)
+        self.T = Grid(self, _pygetm.TGRID, ioffset=1, joffset=1, ugrid=self.U, vgrid=self.V)
         self.X = Grid(self, _pygetm.XGRID, ioffset=0, joffset=0)
 
         self.initialized = False
@@ -319,7 +343,7 @@ class Domain(_pygetm.Domain):
     def add_open_boundary(self, side: int, l: int, mstart: int, mstop: int, type_2d: int, type_3d: int):
         self.open_boundaries.setdefault(side, []).append((l, mstart, mstop, type_2d, type_3d))
 
-    def initialize(self, runtype):
+    def initialize(self, runtype, field_manager: Optional[output.FieldManager]=None):
         assert not self.initialized, 'Domain has already been initialized'
         # Mask U,V,X points without any valid T neighbor - this mask will be maintained by the domain to be used for e.g. plotting
         tmask = self.mask_[1::2, 1::2]
@@ -327,6 +351,10 @@ class Domain(_pygetm.Domain):
         self.mask_[1::2, 2:-2:2][numpy.logical_and(tmask[:, 1:] == 0, tmask[:, :-1] == 0)] = 0
         self.mask_[2:-2:2, 2:-2:2][numpy.logical_and(numpy.logical_and(tmask[1:, 1:] == 0, tmask[:-1, 1:] == 0), numpy.logical_and(tmask[1:, :-1] == 0, tmask[:-1, :-1] == 0))] = 0
         self.exchange_metric(self.mask_, fill_value=0)
+
+        if field_manager is not None:
+            self.field_manager = field_manager
+        self.field_manager = self.field_manager or output.FieldManager()
 
         nbdyp = 0
         bdy_i, bdy_j = [], []
@@ -365,8 +393,16 @@ class Domain(_pygetm.Domain):
         self.exchange_metric(mask_, fill_value=0)
         self.mask_[...] = mask_
 
-        for grid in (self.T, self.U, self.V, self.X):
+        for grid in self.grids.values():
             grid.initialize()
+        self.UU.mask.all_values[...] = 0
+        self.UV.mask.all_values[...] = 0
+        self.VU.mask.all_values[...] = 0
+        self.VV.mask.all_values[...] = 0
+        self.UU.mask.all_values[:, :-1][numpy.logical_and(self.U.mask.all_values[:, :-1], self.U.mask.all_values[:,1:])] = 1
+        self.UV.mask.all_values[:-1, :][numpy.logical_and(self.U.mask.all_values[:-1, :], self.U.mask.all_values[1:,:])] = 1
+        self.VU.mask.all_values[:, :-1][numpy.logical_and(self.V.mask.all_values[:, :-1], self.V.mask.all_values[:,1:])] = 1
+        self.VV.mask.all_values[:-1, :][numpy.logical_and(self.V.mask.all_values[:-1, :], self.V.mask.all_values[1:,:])] = 1
 
         self.H_.flags.writeable = self.H.flags.writeable = False
         self.z0_.flags.writeable = self.z0.flags.writeable = False

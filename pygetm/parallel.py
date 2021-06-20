@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Tuple
 import functools
 
 from mpi4py import MPI
@@ -7,18 +7,33 @@ import numpy
 Waitall = MPI.Request.Waitall
 
 class Tiling:
-    def __init__(self, nrow: int, ncol: int, comm=MPI.COMM_WORLD, periodic_x: bool=False, periodic_y: bool=False):
+    def __init__(self, nrow: Optional[int]=None, ncol: Optional[int]=None, comm=MPI.COMM_WORLD, periodic_x: bool=False, periodic_y: bool=False):
+        self.n_neigbors = 0
         def find_neighbor(i, j):
             if periodic_x:
                 j = j % ncol
             if periodic_y:
                 i = i % nrow
             if i >= 0 and i < nrow and j >= 0 and j < ncol:
+                self.n_neigbors += 1
                 return self.map[i, j]
 
         self.comm = comm
-        assert self.comm.Get_size() == nrow * ncol, 'number of subdomains (%i rows * %i columns = %i) does not match group size of MPI communicator (%i)' % (nrow, ncol, nrow * ncol, self.comm.Get_size())
         self.rank = self.comm.Get_rank()
+        self.n: int = self.comm.Get_size()
+        if nrow is None and ncol is None:
+            # Temporary algorithm for determining subdomain decomposition
+            best = None
+            for nrow in range(1, self.n + 1):
+                if self.n % nrow == 0:
+                    ncol = self.n // nrow
+                    n_exchange = nrow * ncol * 8 - nrow * 2 - ncol * 2 - 4
+                    if best is None or n_exchange < best[0]:
+                        best = (n_exchange, nrow, ncol)
+            nrow, ncol = best[1:]
+            if self.n > 1 and self.rank == 0:
+                print('Using subdomain decomposition %i x %i' % (nrow, ncol))
+        assert nrow * ncol in (1, self.n), 'number of subdomains (%i rows * %i columns = %i) does not match group size of MPI communicator (%i)' % (nrow, ncol, nrow * ncol, self.n)
         self.map = numpy.arange(nrow * ncol).reshape(nrow, ncol)
 
         self.irow, self.icol = divmod(self.rank, ncol)
@@ -33,7 +48,12 @@ class Tiling:
         self.bottomleft = find_neighbor(self.irow - 1, self.icol - 1)
         self.bottomright = find_neighbor(self.irow - 1, self.icol + 1)
 
-    def wrap(self, field, halo: int):
+        self.caches = {}
+
+    def __bool__(self) -> bool:
+        return self.n_neigbors > 0
+
+    def wrap(self, field: numpy.ndarray, halo: int):
         return DistributedArray(self, field, halo)
 
     def describe(self):
@@ -55,81 +75,135 @@ class Tiling:
             for j in range(self.ncol):
                 ax.text(0.5 * (x[j] + x[j + 1]), 0.5 * (y[i] + y[i + 1]), '%i' % self.map[i, j], horizontalalignment='center', verticalalignment='center')
 
-class DistributedArray:
-    __slots__ = ['tiling', 'comm', 'sendtasks', 'recvtasks', 'f_', 'f', 'halo']
-    def __init__(self, tiling: Tiling, field: numpy.ndarray, halo: int):
-        self.tiling = tiling
-        self.comm = tiling.comm
-        self.f_ = field
-        self.f = field[..., halo:-halo, halo:-halo]
-        self.halo = halo
+ALL = 0
+TOP_BOTTOM = 1
+LEFT_RIGHT = 2
 
-        self.sendtasks = []
-        self.recvtasks = []
-        def add_task(neighbor, sendtag, recvtag, inner, outer):
+class DistributedArray:
+    __slots__ = ['rank', 'group2task', 'neighbor2name']
+    def __init__(self, tiling: Tiling, field: numpy.ndarray, halo: int):
+        self.rank = tiling.rank
+        self.group2task = {ALL: ([], []), TOP_BOTTOM: ([], []), LEFT_RIGHT: ([], [])}
+        self.neighbor2name = {}
+
+        key = (field.shape, halo, field.dtype)
+        caches = tiling.caches.get(key)
+        owncaches = []
+
+        def add_task(name: str, sendtag: int, recvtag: int, inner: numpy.ndarray, outer: numpy.ndarray, groups: Tuple[int, ...]):
+            neighbor = getattr(tiling, name)
             assert inner.shape == outer.shape
             if neighbor is not None:
-                inner_cache = numpy.empty_like(inner)
-                outer_cache = numpy.empty_like(outer)
-                self.sendtasks.append((functools.partial(self.comm.Isend, inner_cache, neighbor, sendtag), inner, inner_cache))
-                self.recvtasks.append((functools.partial(self.comm.Irecv, outer_cache, neighbor, recvtag), outer, outer_cache))
+                if caches:
+                    inner_cache, outer_cache = caches[len(owncaches)]
+                else:
+                    inner_cache, outer_cache = numpy.empty_like(inner), numpy.empty_like(outer)
+                owncaches.append((inner_cache, outer_cache))
+                sendtask = (functools.partial(tiling.comm.Isend, inner_cache, neighbor, sendtag), inner, inner_cache)
+                recvtask = (functools.partial(tiling.comm.Irecv, outer_cache, neighbor, recvtag), outer, outer_cache)
+                self.neighbor2name[neighbor] = name
+                for group in groups:
+                    sendtasks, recvtasks = self.group2task[group]
+                    sendtasks.append(sendtask)
+                    recvtasks.append(recvtask)
 
-        add_task(tiling.left, 0, 1, field[..., halo:-halo, halo:halo*2], field[..., halo:-halo, :halo])
-        add_task(tiling.right, 1, 0, field[..., halo:-halo, -halo*2:-halo], field[..., halo:-halo, -halo:])
-        add_task(tiling.top, 2, 3, field[..., -halo*2:-halo, halo:-halo], field[..., -halo:, halo:-halo])
-        add_task(tiling.bottom, 3, 2, field[..., halo:halo*2, halo:-halo], field[..., :halo, halo:-halo])
-        add_task(tiling.topleft, 4, 7, field[..., -halo*2:-halo, halo:halo*2], field[..., -halo:, :halo])
-        add_task(tiling.topright, 5, 6, field[..., -halo*2:-halo, -halo*2:-halo], field[..., -halo:, -halo:])
-        add_task(tiling.bottomleft, 6, 5, field[..., halo:halo*2, halo:halo*2], field[..., :halo, :halo])
-        add_task(tiling.bottomright, 7, 4, field[..., halo:halo*2, -halo*2:-halo], field[..., :halo, -halo:])
+        add_task('bottomleft',  6, 5, field[...,  halo  :halo*2,  halo  :halo*2], field[...,      :halo,       :halo ], groups=(ALL,))
+        add_task('bottom',      3, 2, field[...,  halo  :halo*2,  halo  :-halo],  field[...,      :halo,   halo:-halo], groups=(ALL, TOP_BOTTOM))
+        add_task('bottomright', 7, 4, field[...,  halo  :halo*2, -halo*2:-halo],  field[...,      :halo,  -halo:     ], groups=(ALL,))
+        add_task('left',        0, 1, field[...,  halo  :-halo,   halo  :halo*2], field[...,  halo:-halo,      :halo ], groups=(ALL, LEFT_RIGHT))
+        add_task('right',       1, 0, field[...,  halo  :-halo,  -halo*2:-halo],  field[...,  halo:-halo, -halo:     ], groups=(ALL, LEFT_RIGHT))
+        add_task('topleft',     4, 7, field[..., -halo*2:-halo,   halo  :halo*2], field[..., -halo:,           :halo ], groups=(ALL,))
+        add_task('top',         2, 3, field[..., -halo*2:-halo,   halo  :-halo],  field[..., -halo:,       halo:-halo], groups=(ALL, TOP_BOTTOM))
+        add_task('topright',    5, 6, field[..., -halo*2:-halo,  -halo*2:-halo],  field[..., -halo:,      -halo:     ], groups=(ALL,))
+        if caches is None:
+            tiling.caches[key] = owncaches
 
-    def update_halos(self):
-        recreqs = [fn() for fn, _, _ in self.recvtasks]
+    def update_halos(self, group: int=ALL):
+        sendtasks, recvtasks = self.group2task[group]
+        recreqs = [fn() for fn, _, _ in recvtasks]
         sendreqs = []
-        for fn, inner, cache in self.sendtasks:
+        for fn, inner, cache in sendtasks:
             cache[...] = inner
             sendreqs.append(fn())
         Waitall(recreqs)
-        for _, outer, cache in self.recvtasks:
+        for _, outer, cache in recvtasks:
             outer[...] = cache
         Waitall(sendreqs)
 
-    def gather(self, root: int=0, out: Optional[numpy.ndarray]=None):
-        rankmap = self.tiling.map
-        rank = self.comm.Get_rank()
-        sendbuf = numpy.ascontiguousarray(self.f)
-        recvbuf = None
-        if rank == root:
-            recvbuf = numpy.empty((rankmap.size,) + self.f.shape, dtype=self.f.dtype)
-        self.comm.Gather(sendbuf, recvbuf, root=root)
-        if rank == root:
-            nrow, ncol = rankmap.shape
-            ny, nx = recvbuf.shape[-2:]
+    def compare_halos(self, group: int=ALL) -> bool:
+        sendtasks, recvtasks = self.group2task[group]
+        recreqs = [fn() for fn, _, _ in recvtasks]
+        sendreqs = []
+        for fn, inner, cache in sendtasks:
+            cache[...] = inner
+            sendreqs.append(fn())
+        Waitall(recreqs)
+        match = True
+        for fn, outer, cache in recvtasks:
+            if not (outer == cache).all():
+                delta = outer - cache
+                print('Rank %i: mismatch in %s halo! Maximum absolute difference: %s. Values: %s' % (self.rank, self.neighbor2name[fn.args[1]], numpy.abs(delta).max(), delta))
+                match = False
+        Waitall(sendreqs)
+        return match
+
+class Sum:
+    def __init__(self, tiling: Tiling, field: numpy.ndarray, root: int=0):
+        self.comm = tiling.comm
+        self.root = root
+        self.field = field
+        self.result = None if tiling.rank != self.root else numpy.empty_like(field)
+
+    def __call__(self):
+        self.comm.Reduce(self.field, self.result, op=MPI.SUM, root=self.root)
+        return self.result
+
+class Gather:
+    def __init__(self, tiling: Tiling, field: numpy.ndarray, root: int=0):
+        self.rankmap = tiling.map
+        self.comm = tiling.comm
+        self.root = root
+        self.field = field
+        self.recvbuf = None
+        if tiling.rank == self.root:
+            self.recvbuf = numpy.empty((self.rankmap.size,) + self.field.shape, dtype=self.field.dtype)
+
+    def __call__(self, out: Optional[numpy.ndarray]=None, slice_spec=()) -> numpy.ndarray:
+        sendbuf = numpy.ascontiguousarray(self.field)
+        self.comm.Gather(sendbuf, self.recvbuf, root=self.root)
+        if self.recvbuf is not None:
+            nrow, ncol = self.rankmap.shape
+            ny, nx = self.recvbuf.shape[-2:]
             if out is None:
-                out = numpy.empty(recvbuf.shape[1:-2] + (nrow * ny, ncol * nx), dtype=recvbuf.dtype)
-            for i in range(nrow):
-                for j in range(ncol):
-                    out[..., i * ny:(i + 1) * ny, j * nx:(j + 1) * nx] = recvbuf[rankmap[i, j], ...]
+                out = numpy.empty(self.recvbuf.shape[1:-2] + (nrow * ny, ncol * nx), dtype=self.recvbuf.dtype)
+            for row in range(nrow):
+                for col in range(ncol):
+                    s = slice_spec + (Ellipsis, slice(row * ny, (row + 1) * ny), slice(col * nx, (col + 1) * nx))
+                    out[s] = self.recvbuf[self.rankmap[row, col], ...]
             return out
 
-    def scatter(self, data: numpy.ndarray, root: int=0):
-        rankmap = self.tiling.map
-        rank = self.comm.Get_rank()
-        recvbuf = numpy.empty_like(self.f_)
-        sendbuf = None
-        if rank == root:
-            sendbuf = numpy.zeros((rankmap.size,) + recvbuf.shape, dtype=recvbuf.dtype)
-            ny, nx = self.f.shape[-2:]
-            nrow, ncol = rankmap.shape
-            halo = self.halo
-            assert nrow * ny == data.shape[-2] and ncol * nx == data.shape[-1], '%s, %i, %i' % (data.shape, nrow * ny, ncol * nx)
-            for i in range(nrow):
-                for j in range(ncol):
-                    imin_off = 0 if i == 0 else halo
-                    imax_off = 0 if i == nrow - 1 else halo
-                    jmin_off = 0 if j == 0 else halo
-                    jmax_off = 0 if j == ncol - 1 else halo
-                    sendbuf[rankmap[i, j], ..., halo - imin_off:halo + ny + imax_off, halo - jmin_off:halo + nx + jmax_off] = data[..., i * ny - imin_off:(i + 1) * ny + imax_off, j * nx - jmin_off:(j + 1) * nx + jmax_off]
-        self.comm.Scatter(sendbuf, recvbuf, root=root)
-        self.f_[...] = recvbuf
+class Scatter:
+    def __init__(self, tiling: Tiling, field: numpy.ndarray, halo: int, share: int=0, root: int=0):
+        self.field = field
+        self.recvbuf = numpy.ascontiguousarray(field)
+        self.rankmap = tiling.map
+        self.halo = halo
+        self.share = share
+        self.sendbuf = None
+        if tiling.comm.Get_rank() == root:
+            self.sendbuf = numpy.zeros((self.rankmap.size,) + self.recvbuf.shape, dtype=self.recvbuf.dtype)
+        self.mpi_scatter = functools.partial(tiling.comm.Scatter, self.sendbuf, self.recvbuf, root=root)
+
+    def __call__(self, global_data: Optional[numpy.ndarray]):
+        if self.sendbuf is not None:
+            ny, nx = self.field.shape[-2:]
+            xspacing, yspacing = nx - 2 * self.halo - self.share, ny - 2 * self.halo - self.share
+            nrow, ncol = self.rankmap.shape
+            assert nrow * yspacing + 2 * self.halo + self.share == global_data.shape[-2] and ncol * xspacing + 2 * self.halo + self.share == global_data.shape[-1], '%s, %i, %i' % (global_data.shape, nrow * yspacing + 2 * self.halo + self.share, ncol * xspacing + 2 * self.halo + self.share)
+            for row in range(nrow):
+                for col in range(ncol):
+                    self.sendbuf[self.rankmap[row, col], ...] = global_data[..., row * yspacing:row * yspacing + ny, col * xspacing:col * xspacing + nx]
+        self.mpi_scatter()
+        if self.recvbuf is not self.field:
+            self.field[...] = self.recvbuf
 
