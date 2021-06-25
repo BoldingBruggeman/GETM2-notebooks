@@ -1,17 +1,18 @@
 import numbers
 from typing import Optional
 
-import numpy, numpy.lib.mixins
+import numpy, numpy.lib.mixins, numpy.typing
 import xarray
 
 from . import _pygetm
 from . import parallel
 
 class Array(_pygetm.Array, numpy.lib.mixins.NDArrayOperatorsMixin):
-    def __init__(self, name=None, units=None, long_name=None):
-        self._x = None
-        self._scatter = None
-        self._gather = None
+    def __init__(self, name: Optional[str]=None, units: Optional[str]=None, long_name: Optional[str]=None):
+        self._xarray: Optional[xarray.DataArray] = None
+        self._scatter: Optional[parallel.Scatter] = None
+        self._gather: Optional[parallel.Gather] = None
+        self._dist: Optional[parallel.DistributedArray] = None
         self._name = name
         self._units = units
         self._long_name = long_name
@@ -20,10 +21,18 @@ class Array(_pygetm.Array, numpy.lib.mixins.NDArrayOperatorsMixin):
         return super().__repr__() + self.grid.postfix
 
     def update_halos(self, *args, **kwargs):
-        pass
+        if not self.grid.domain.tiling:
+            return
+        if self._dist is None:
+            self._dist = parallel.DistributedArray(self.grid.domain.tiling, self.all_values, self.grid.halo)
+        return self._dist.update_halos(*args, **kwargs)
 
     def compare_halos(self, *args, **kwargs):
-        return True
+        if not self.grid.domain.tiling:
+            return True
+        if self._dist is None:
+            self._dist = parallel.DistributedArray(self.grid.domain.tiling, self.all_values, self.grid.halo)
+        return self._dist.compare_halos(*args, **kwargs)
 
     def scatter(self, global_data: Optional['Array']):
         if self.grid.domain.tiling.n == 1:
@@ -46,7 +55,7 @@ class Array(_pygetm.Array, numpy.lib.mixins.NDArrayOperatorsMixin):
             out[...] = result
         return out
 
-    def global_sum(self, reproducible: bool=False, where=None):
+    def global_sum(self, reproducible: bool=False, where: Optional['Array']=None) -> Optional[numpy.ndarray]:
         if reproducible:
             all = self.gather()
             if where is not None:
@@ -57,7 +66,7 @@ class Array(_pygetm.Array, numpy.lib.mixins.NDArrayOperatorsMixin):
             local_sum = self.values.sum(where=numpy._NoValue if where is None else where.values)
             return parallel.Sum(self.grid.domain.tiling, local_sum)()
 
-    def global_mean(self, reproducible: bool=False, where=None):
+    def global_mean(self, reproducible: bool=False, where: Optional['Array']=None) -> Optional[numpy.ndarray]:
         sum = self.global_sum(reproducible=reproducible, where=where)
         if where is not None:
             count = where.global_sum()
@@ -70,16 +79,11 @@ class Array(_pygetm.Array, numpy.lib.mixins.NDArrayOperatorsMixin):
         assert self.grid is not None
         if self.name is not None:
             self.grid.domain.field_manager.register(self)
-        tiling = self.grid.domain.tiling
-        if tiling:
-            dist = parallel.DistributedArray(tiling, self.all_values, self.grid.halo)
-            self.update_halos = dist.update_halos
-            self.compare_halos = dist.compare_halos
         halo = self.grid.halo
         self.values = self.all_values[halo:-halo, halo:-halo]
 
     @staticmethod
-    def create(grid, fill=None, dtype=None, copy=True, **kwargs) -> 'Array':
+    def create(grid, fill: Optional[numpy.typing.ArrayLike]=None, dtype: numpy.typing.DTypeLike=None, copy: bool=True, **kwargs) -> 'Array':
         ar = Array(**kwargs)
         if fill is not None:
             fill = numpy.asarray(fill)
@@ -100,14 +104,32 @@ class Array(_pygetm.Array, numpy.lib.mixins.NDArrayOperatorsMixin):
         return numpy.ma.array(self.values, mask=self.grid.mask.values==0)
 
     @property
-    def x(self) -> xarray.DataArray:
-        if self._x is None:
-            self._x = xarray.DataArray(self.values)
-        return self._x
+    def xarray(self) -> xarray.DataArray:
+        if self._xarray is None:
+            attrs = {}
+            for key in ('units', 'long_name'):
+                value = getattr(self, key)
+                if value is not None:
+                    attrs[key] = value
+            dom = self.grid.domain
+            coords = {}
+            if self.name not in ('x' + self.grid.postfix, 'y' + self.grid.postfix, 'lon' + self.grid.postfix, 'lat' + self.grid.postfix):
+                if dom.x_is_1d:
+                    coords['x%s' % self.grid.postfix] = self.grid.x.xarray[0, :]
+                if dom.y_is_1d:
+                    coords['y%s' % self.grid.postfix] = self.grid.y.xarray[:, 0]
+                coords['x%s2' % self.grid.postfix] = self.grid.x.xarray
+                coords['y%s2' % self.grid.postfix] = self.grid.y.xarray
+                if dom.lon is not None:
+                    coords['lon%s' % self.grid.postfix] = self.grid.lon.xarray
+                if dom.lat is not None:
+                    coords['lat%s' % self.grid.postfix] = self.grid.lat.xarray
+            self._xarray = xarray.DataArray(self.values, coords=coords, dims=('y' + self.grid.postfix, 'x' + self.grid.postfix), attrs=attrs, name=self.name)
+        return self._xarray
 
     @property
     def plot(self):
-        return self.x.plot
+        return self.xarray.plot
 
     def interp(self, target_grid, out: Optional['Array'] = None):
         if out is None:
